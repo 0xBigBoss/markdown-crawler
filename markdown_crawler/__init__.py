@@ -19,10 +19,10 @@ __copyright__ = "(C) 2023 Paul Pierre. MIT License."
 __contributors__ = ['Paul Pierre']
 
 BANNER = """
-                |                                     |             
- __ `__ \    _` |        __|   __|   _` | \ \  \   /  |   _ \   __| 
- |   |   |  (   |       (     |     (   |  \ \  \ /   |   __/  |    
-_|  _|  _| \__._|      \___| _|    \__._|   \_/\_/   _| \___| _|    
+                |                                     |
+ __ `__ \    _` |        __|   __|   _` | \ \  \   /  |   _ \   __|
+ |   |   |  (   |       (     |     (   |  \ \  \ /   |   __/  |
+_|  _|  _| \__._|      \___| _|    \__._|   \_/\_/   _| \___| _|
 
 -------------------------------------------------------------------------
 A multithreaded 🕸️ web crawler that recursively crawls a website and
@@ -32,12 +32,14 @@ creates a 🔽 markdown file for each page by https://github.com/paulpierre
 
 logger = logging.getLogger(__name__)
 DEFAULT_BASE_DIR = 'markdown'
+DEFAULT_IMAGES_DIR = 'images'
 DEFAULT_MAX_DEPTH = 3
 DEFAULT_NUM_THREADS = 5
 DEFAULT_TARGET_CONTENT = ['article', 'div', 'main', 'p']
 DEFAULT_TARGET_LINKS = ['body']
 DEFAULT_DOMAIN_MATCH = True
 DEFAULT_BASE_PATH_MATCH = True
+DEFAULT_SAVE_IMAGES = True
 
 
 # --------------
@@ -61,6 +63,86 @@ def normalize_url(url: str) -> str:
 
 
 # ------------------
+# Save image to disk
+# ------------------
+def save_image(img_url: str, base_url: str, images_dir: str) -> Optional[str]:
+    if not is_valid_url(img_url):
+        # Try to join with base_url if it's a relative path
+        img_url = urllib.parse.urljoin(base_url, img_url)
+        if not is_valid_url(img_url):
+            logger.debug(f'❌ Invalid image URL: {img_url}')
+            return None
+
+    try:
+        # Create a filename from the URL path
+        img_path = urllib.parse.urlparse(img_url).path
+        img_name = img_path.split('/')[-1]
+
+        # Remove query parameters if present
+        if '?' in img_name:
+            img_name = img_name.split('?')[0]
+
+        # Ensure the name has a valid extension
+        if not any(img_name.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']):
+            img_name = f"{img_name}.jpg"  # Default to jpg if no extension
+
+        # Create unique filename to avoid overwriting
+        img_file_path = os.path.join(images_dir, img_name)
+        counter = 1
+        while os.path.exists(img_file_path):
+            name_parts = os.path.splitext(img_name)
+            img_file_path = os.path.join(images_dir, f"{name_parts[0]}_{counter}{name_parts[1]}")
+            counter += 1
+
+        # Download the image
+        response = requests.get(img_url, stream=True, timeout=10)
+        if response.status_code == 200:
+            with open(img_file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+            logger.debug(f'💾 Saved image: {img_file_path}')
+            return img_file_path
+        else:
+            logger.debug(f'❌ Failed to download image: {img_url}, status code: {response.status_code}')
+            return None
+    except Exception as e:
+        logger.debug(f'❌ Error saving image {img_url}: {e}')
+        return None
+
+
+# ----------------------------
+# Process images in HTML content
+# ----------------------------
+def process_images(soup: BeautifulSoup, base_url: str, images_dir: str) -> BeautifulSoup:
+    # Create images directory if it doesn't exist
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
+
+    # Find all image tags
+    for img in soup.find_all('img'):
+        img_src = img.get('src')
+        if img_src:
+            local_path = save_image(img_src, base_url, images_dir)
+            if local_path:
+                # Update the src to point to the local file
+                img['src'] = os.path.relpath(local_path, os.path.dirname(images_dir))
+
+    # Find all picture elements with source tags
+    for source in soup.find_all('source'):
+        if source.get('srcset'):
+            # Handle srcset attribute (might contain multiple URLs)
+            srcset = source.get('srcset')
+            # Simple handling - just grab the first URL before any size descriptors
+            first_url = srcset.split(',')[0].strip().split(' ')[0]
+            local_path = save_image(first_url, base_url, images_dir)
+            if local_path:
+                source['srcset'] = os.path.relpath(local_path, os.path.dirname(images_dir))
+
+    return soup
+
+
+# ------------------
 # HTML parsing logic
 # ------------------
 def crawl(
@@ -73,7 +155,9 @@ def crawl(
     valid_paths: Union[str, List[str]] = None,
     is_domain_match: Optional[bool] = DEFAULT_DOMAIN_MATCH,
     is_base_path_match: Optional[bool] = DEFAULT_BASE_PATH_MATCH,
-    is_links: Optional[bool] = False
+    is_links: Optional[bool] = False,
+    is_save_images: Optional[bool] = DEFAULT_SAVE_IMAGES,
+    images_dir: Optional[str] = DEFAULT_IMAGES_DIR
 ) -> List[str]:
 
     if url in already_crawled:
@@ -116,12 +200,23 @@ def crawl(
         # ------------------
         # Get target content
         # ------------------
-
         content = get_target_content(soup, target_content=target_content)
 
         if content:
-            # logger.error(f'❌ Empty content for {file_path}. Please check your targets skipping.')
-            # return []
+            # ----------------------------
+            # Process images if requested
+            # ----------------------------
+            content_soup = BeautifulSoup(content, 'html.parser')
+
+            if is_save_images:
+                # Ensure images directory exists relative to the markdown file location
+                page_images_dir = os.path.join(os.path.dirname(file_path), images_dir)
+                if not os.path.exists(page_images_dir):
+                    os.makedirs(page_images_dir)
+
+                # Process and save images
+                content_soup = process_images(content_soup, url, page_images_dir)
+                content = str(content_soup)
 
             # --------------
             # Parse markdown
@@ -148,7 +243,7 @@ def crawl(
         target_links,
         valid_paths=valid_paths,
         is_domain_match=is_domain_match,
-        is_base_path_match=is_base_path_match    
+        is_base_path_match=is_base_path_match
     )
 
     logger.debug(f'Found {len(child_urls) if child_urls else 0} child URLs')
@@ -241,7 +336,9 @@ def worker(
     valid_paths: Union[List[str], None] = None,
     is_domain_match: bool = None,
     is_base_path_match: bool = None,
-    is_links: Optional[bool] = False
+    is_links: Optional[bool] = False,
+    is_save_images: Optional[bool] = DEFAULT_SAVE_IMAGES,
+    images_dir: Optional[str] = DEFAULT_IMAGES_DIR
 ) -> None:
 
     while not q.empty():
@@ -262,7 +359,9 @@ def worker(
             valid_paths,
             is_domain_match,
             is_base_path_match,
-            is_links
+            is_links,
+            is_save_images,
+            images_dir
         )
         child_urls = [normalize_url(u) for u in child_urls]
         for child_url in child_urls:
@@ -284,13 +383,16 @@ def md_crawl(
         is_domain_match: Optional[bool] = None,
         is_base_path_match: Optional[bool] = None,
         is_debug: Optional[bool] = False,
-        is_links: Optional[bool] = False
+        is_links: Optional[bool] = False,
+        is_save_images: Optional[bool] = DEFAULT_SAVE_IMAGES,
+        images_dir: Optional[str] = DEFAULT_IMAGES_DIR
 ) -> None:
     if is_domain_match is False and is_base_path_match is True:
         raise ValueError('❌ Domain match must be True if base match is set to True')
 
     is_domain_match = DEFAULT_DOMAIN_MATCH if is_domain_match is None else is_domain_match
     is_base_path_match = DEFAULT_BASE_PATH_MATCH if is_base_path_match is None else is_base_path_match
+    is_save_images = DEFAULT_SAVE_IMAGES if is_save_images is None else is_save_images
 
     if not base_url:
         raise ValueError('❌ Base URL is required')
@@ -311,6 +413,8 @@ def md_crawl(
         logging.basicConfig(level=logging.INFO)
 
     logger.info(f'🕸️ Crawling {base_url} at ⏬ depth {max_depth} with 🧵 {num_threads} threads')
+    if is_save_images:
+        logger.info(f'📸 Saving images to {os.path.join(base_dir, images_dir)}')
 
     # Validate the base URL
     if not is_valid_url(base_url):
@@ -319,6 +423,12 @@ def md_crawl(
     # Create base_dir if it doesn't exist
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
+
+    # Create images directory if needed
+    if is_save_images:
+        images_path = os.path.join(base_dir, images_dir)
+        if not os.path.exists(images_path):
+            os.makedirs(images_path)
 
     already_crawled = set()
 
@@ -345,7 +455,9 @@ def md_crawl(
                 valid_paths,
                 is_domain_match,
                 is_base_path_match,
-                is_links
+                is_links,
+                is_save_images,
+                images_dir
             )
         )
         threads.append(t)
